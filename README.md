@@ -49,8 +49,6 @@ cmake --install .
 Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
 
 ## External Tools
-
-### C/C++
 - [safetyhook](https://github.com/cursey/safetyhook)
 - [spdlog](https://github.com/gabime/spdlog)
 - [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
