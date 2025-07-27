@@ -1,0 +1,18 @@
+name: God Eater 1-2 Fix
+
+# Enables or disables this mod.
+masterEnable: true
+
+# Enter desired resolution.
+# A value of 0 in either width or height will use your desktop's resolution.
+resolution:
+  width: 0
+  height: 0
+
+# Available features
+features:
+
+  # If enabled HUD will be constrained to 16:9.
+  # If disabled HUD will stretch to fill the screen.
+  constrainHud:
+    enable: true
