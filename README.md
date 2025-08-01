@@ -38,12 +38,12 @@ cmake --install .
 | GOD EATER RESURRECTION |
 | --- |
 | ![Demo1](images/GodEater1-2Fix_1.gif) |
-| Fix disabled → Fix enabled |
+| <p align='center'> Fix disabled → Fix enabled </p> |
 
 | GOD EATER 2 Rage Burst |
 | --- |
 | ![Demo2](images/GodEater1-2Fix_2.gif) |
-| Fix disabled → Fix enabled |
+| <p align='center'> Fix disabled → Fix enabled </p> |
 
 ## License
 Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
