@@ -15,4 +15,4 @@ features:
   # If enabled HUD will be constrained to 16:9.
   # If disabled HUD will stretch to fill the screen.
   constrainHud:
-    enable: true
+    enable: false

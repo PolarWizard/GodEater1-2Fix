@@ -277,6 +277,29 @@ void resolutionFix() {
  * to which we can make memory modifications and just like that UI is fixed and nicely constrained to
  * 16:9 just as intended.
  *
+ * EDIT: v1.0.1
+ * The above is wrong for the calculation. As of issue #1 someone reported that the HUD does not center
+ * correctly at 21:9. After investigating this it turns out that there is a pretty complex formula you
+ * need for ctx.eax+0x00, for 32:9 it was simple to get the center since 32:9 is just 2x of 16:9, but
+ * for 21:9 things where weird. Ultimately I figured out the relationship between ctx.eax+0x00 and
+ * ctx.eax+0x30, where a part of the calculation for ctx.eax+0x30 is needed in ctx.eax+0x00 and the
+ * final formula/calculation can be seen in the code below. The reason why this worked flawlessly in
+ * 32:9 was because the calculation will always 1 / width:
+ * Reverse engineered equation for ctx.eax+0x00:
+ *       1                    1                 2       nativeWidth
+ * ------------ * ------------------------ = ------- * -------------
+ *  (width / 2)     (width / nativeWidth)     width        width
+ *
+ * if 3440x1440 (21:9) then:
+ * (2 / 3440) * (2560 / 3440) = 0.00058139535, unnormalized = 1/0.00058139535 = ~2311
+ *
+ * if 7680x2160 (32:9) then:
+ * (2 / 7680) * (3840 / 7680) = 1 / 7680 =  0.00013020833, unnormalized = 1/0.00013020833 = 7680
+ *                                 ^
+ *                                 This is what I had initially
+ *                                 in the mod and you can see
+ *                                 where that comes from
+ *
  * @return void
  */
 void hudElementsFix() {
@@ -285,9 +308,12 @@ void hudElementsFix() {
     bool enable = yml.masterEnable && yml.feature.constrainHud.enable;
     Utils::injectHook(enable, module, hook,
         [](SafetyHookContext& ctx) {
-            if (*(uint32_t*)(ctx.eax + 0x30) == 0xBF800000 && *(uint32_t*)(ctx.eax + 0x3C) == 0x3F800000) {
-                *(float*)(ctx.eax + 0x00) = 1.0f / static_cast<float>(yml.resolution.width);
-                *(float*)(ctx.eax + 0x30) = (static_cast<float>(nativeWidth) / static_cast<float>(yml.resolution.width)) * -1.0f;
+            u32 scaler0 = *reinterpret_cast<u32*>(ctx.eax + 0x30);
+            u32 scaler1 = *reinterpret_cast<u32*>(ctx.eax + 0x3C);
+            if (((scaler0 & 0xBF000000) == 0xBF000000) && ((scaler1 & 0x3F000000) == 0x3F000000)) {
+                f32 ratio = static_cast<f32>(nativeWidth) / static_cast<f32>(yml.resolution.width);
+                *reinterpret_cast<f32*>(ctx.eax + 0x00) = (2.0f / static_cast<f32>(yml.resolution.width)) * ratio;
+                *reinterpret_cast<f32*>(ctx.eax + 0x30) = ratio * -1.0f;
             }
         }
     );
