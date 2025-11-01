@@ -42,7 +42,7 @@
 #include "utils.hpp"
 
 // Macros
-#define VERSION "1.0.0"
+#define VERSION "1.0.1"
 
 // .yml to struct
 typedef struct resolution_t {
