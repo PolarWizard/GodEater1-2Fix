@@ -446,7 +446,10 @@ void hudElementsFix() {
  */
 void moviesFix() {
     Utils::SignatureHook openHook(
-        "55 89 E5 6A FF 68 EF 35 38 02 64 A1 00 00 00 00 50 81 EC 3C 01 00 00"
+        "55 89 E5    6A FF    68 ?? ?? ?? ??    64 A1 00 00 00 00    50    81 EC 3C 01 00 00"
+        "    A1 ?? ?? ?? ??    31 E8    89 85 F0 FF FF FF"
+        "    53    56    57    50    8D 85 F4 FF FF FF    64 A3 00 00 00 00"
+        "    89 CB    89 9D DC FE FF FF    8B 45 08    6A 00"
     );
     Utils::SignatureHook realStopHook(
         "56 89 CE 83 7E 08 00 74 18 8B 4E 1C 85 C9 74 08 8B 01 FF 90 80 00 00 00 8B 46 08 50 8B 08 FF 51 24",
