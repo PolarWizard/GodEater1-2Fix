@@ -309,51 +309,40 @@ void configResolutionFix() {
  * how they are anchored and what effects they have.
  *
  * The typical trick is to scan the game for 1.0f values and modify them slightly and see what effect
- * that has in game if any. Hopefully you get a hit eventually that actually effects the HUD, and for
- * this game that eventually happened.
+ * that has in game if any. With a single 1.0f that controlled the HUD we found some code around
+ * GER.exe+1d510d4 which makes use of this value, and traced forward from there to the hook below.
+ * The enclosing function (ger.exe+2110d4) is a single, generic UI-draw-command enqueue routine
+ * shared by every UI element in the game - HUD frame, minimap, everything funnels through it to
+ * submit a 16-float transform block. Reinterpreted as a standard affine 4x4 matrix, the diagonal
+ * (indices 0/5/10) is the element's scale (X/Y/Z) and the last row (indices 12/13/14) is its
+ * position (X/Y/Z).
  *
- * With a single 1.0f that controlled the HUD we found some code around GER.exe+1d510d4 which makes use
- * of this value and from that point we examined what the code was doing and with that we found some more
- * clues and other memory locations that are of interest.
+ * ctx.eax+0x30/+0x3C (the X and Y slots of that last row) are checked against the exact bit
+ * patterns of -1.0f (0xBF80_0000) and +1.0f (0x3F80_0000) to find elements meant to span the
+ * native-16:9 viewport edge-to-edge - everything else is left alone. Two distinct kinds of element
+ * pass that check and are handled differently, told apart by whether ctx.eax+0x00 (the X scale)
+ * starts at exactly 0.0f:
  *
- * We found two values of interest at ctx.eax+0x00 and ctx.eax+0x30. They were played around with and
- * once the peices clicked and was understood what effect they had it was pretty simple to get some
- * hook code up and running which would do what we wanted.
+ * - Centered, full-width elements (ctx.eax+0x00 starts at 0.0f - health bar frame, etc): here
+ *   ctx.eax+0x30 isn't really a position, it's an "I span the full native-16:9 width" flag, and
+ *   ctx.eax+0x00 is recomputed from scratch to re-center the element in the wider viewport:
+ *     Reverse engineered equation for ctx.eax+0x00:
+ *           1                    1                 2       nativeWidth
+ *     ------------ * ------------------------ = ------- * -------------
+ *      (width / 2)     (width / nativeWidth)     width        width
+ *     if 3440x1440 (21:9): (2/3440) * (2560/3440) = 0.00058139535, unnormalized ~2311
+ *     if 7680x2160 (32:9): (2/7680) * (3840/7680) = 1/7680 = 0.00013020833, unnormalized 7680
  *
- * Now the next issue that was only part of the UI, there were still parts of the UI that were not
- * effected by the fix just implemented, so back to scanning and modifying 1.0f values. Eventually
- * got a promising lead on a value in dynamic memory that fixed the rest of the UI and was accessed
- * in the same location as the first 1.0f hit earlier. Given the first was in the game data section
- * that could easily be hooked up to get the fix, but dynamic memory is tricky we cant just hook up
- * some address and call it a day as the address will change from boot to boot. We need to figure out
- * a way to isolate this from other addresses held in ctx.eax which we do not wanna touch so with
- * enough experimentation and trial and error we could make a basic check to see if ctx.eax+0x30 is
- * 0xBF80_0000 and if ctx.eax+0x3C is 0x3F80_0000 then if both checkout we are dealing with UI data
- * to which we can make memory modifications and just like that UI is fixed and nicely constrained to
- * 16:9 just as intended.
+ * - Corner-anchored elements (ctx.eax+0x00 starts non-zero, ~0.004 - the map/minimap background
+ *   texture is the only known example): here ctx.eax+0x30 is a genuine X position (anchored to
+ *   the native-16:9 left edge) and ctx.eax+0x00 is a genuine pre-existing scale, both living in a
+ *   -1..1 NDC space sized for a 16:9 viewport. Scaling both by the same `ratio` used above maps
+ *   that whole coordinate space onto the 16:9 region now centered in the wider viewport - resizing
+ *   and repositioning it correctly without needing to know anything else about what it is.
  *
- * EDIT: v1.0.1
- * The above is wrong for the calculation. As of issue #1 someone reported that the HUD does not center
- * correctly at 21:9. After investigating this it turns out that there is a pretty complex formula you
- * need for ctx.eax+0x00, for 32:9 it was simple to get the center since 32:9 is just 2x of 16:9, but
- * for 21:9 things where weird. Ultimately I figured out the relationship between ctx.eax+0x00 and
- * ctx.eax+0x30, where a part of the calculation for ctx.eax+0x30 is needed in ctx.eax+0x00 and the
- * final formula/calculation can be seen in the code below. The reason why this worked flawlessly in
- * 32:9 was because the calculation will always 1 / width:
- * Reverse engineered equation for ctx.eax+0x00:
- *       1                    1                 2       nativeWidth
- * ------------ * ------------------------ = ------- * -------------
- *  (width / 2)     (width / nativeWidth)     width        width
- *
- * if 3440x1440 (21:9) then:
- * (2 / 3440) * (2560 / 3440) = 0.00058139535, unnormalized = 1/0.00058139535 = ~2311
- *
- * if 7680x2160 (32:9) then:
- * (2 / 7680) * (3840 / 7680) = 1 / 7680 =  0.00013020833, unnormalized = 1/0.00013020833 = 7680
- *                                 ^
- *                                 This is what I had initially
- *                                 in the mod and you can see
- *                                 where that comes from
+ * There's no type tag anywhere in this data to identify which of the two cases a given element is;
+ * "does ctx.eax+0x00 start at exactly 0.0f" is the only signal found - empirically, by logging
+ * every distinct match during gameplay - that reliably tells them apart.
  *
  * @return void
  */
@@ -365,10 +354,23 @@ void hudElementsFix() {
         [](SafetyHookContext& ctx) {
             u32 scaler0 = *reinterpret_cast<u32*>(ctx.eax + 0x30);
             u32 scaler1 = *reinterpret_cast<u32*>(ctx.eax + 0x3C);
-            if (((scaler0 & 0xBF000000) == 0xBF000000) && ((scaler1 & 0x3F000000) == 0x3F000000)) {
+            f32 valueAtZero = *reinterpret_cast<f32*>(ctx.eax + 0x00);
+            bool isMapBackground = valueAtZero != 0.0f;
+            if (((scaler0 & 0xBF800000) == 0xBF800000) && ((scaler1 & 0x3F800000) == 0x3F800000)) {
                 f32 ratio = static_cast<f32>(nativeWidth) / static_cast<f32>(yml.resolution.width);
-                *reinterpret_cast<f32*>(ctx.eax + 0x00) = (2.0f / static_cast<f32>(yml.resolution.width)) * ratio;
-                *reinterpret_cast<f32*>(ctx.eax + 0x30) = ratio * -1.0f;
+                if (isMapBackground) {
+                    // Unlike the branch below, ctx.eax+0x30 here is an X position (anchored to
+                    // the native-16:9 left edge), not a "full width" flag. Both it and the scale
+                    // at ctx.eax+0x00 live in a -1..1 NDC space sized for a 16:9 viewport. Scaling
+                    // both by the same ratio maps that whole space onto the 16:9 region now
+                    // centered in the wider viewport.
+                    f32 valueAtThirty = *reinterpret_cast<f32*>(ctx.eax + 0x30);
+                    *reinterpret_cast<f32*>(ctx.eax + 0x00) = valueAtZero * ratio;
+                    *reinterpret_cast<f32*>(ctx.eax + 0x30) = valueAtThirty * ratio;
+                } else {
+                    *reinterpret_cast<f32*>(ctx.eax + 0x00) = (2.0f / static_cast<f32>(yml.resolution.width)) * ratio;
+                    *reinterpret_cast<f32*>(ctx.eax + 0x30) = ratio * -1.0f;
+                }
             }
         }
     );
