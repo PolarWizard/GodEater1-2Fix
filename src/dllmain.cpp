@@ -242,6 +242,62 @@ void resolutionFix() {
 }
 
 /**
+ * @brief Forces the game to use our resolution instead of its own saved config.ini value.
+ *
+ * @details
+ * The game persists its own graphics settings (resolution included) in a config.ini under
+ * `%LOCALAPPDATA%\<publisher>\<game>\config.ini`, read via the `[GFX]` section's
+ * `Resolution_Width`/`Resolution_Height` keys - entirely independent of GodEater1-2Fix.yml. If
+ * that file's resolution does not match the resolution requested in GodEater1-2Fix.yml, the game
+ * hangs very early during boot (process alive, no window ever created) - see docs/RE_LOG.md for
+ * the full reverse engineering trail.
+ *
+ * How was this found?
+ * Reverse engineering the game's "Application start" routine (the one-shot boot init that reads
+ * config.ini and creates the game's D3D9 device/window) shows it reads Resolution_Width and
+ * Resolution_Height from config.ini into two stack locals, then copies them into the running
+ * application-context object it's constructing, right before that context is handed off to
+ * device creation:
+ *   ger.exe+809E4  - 8B85 2CFFFFFF     - mov eax,[ebp-D4]   ; eax = parsed Resolution_Width
+ *   ger.exe+809EA  - B9 01000000       - mov ecx,1
+ *   ger.exe+809EF  - 83BD 30FFFFFF 01  - cmp dword ptr [ebp-D0],1
+ *   ger.exe+809F6  - FFB5 28FFFFFF     - push dword ptr [ebp-D8]
+ *   ger.exe+809FC  - 89 46 70          - mov [esi+70],eax   ; app context Width = eax
+ *   ger.exe+809FF  - 8B85 34FFFFFF     - mov eax,[ebp-CC]   ; eax = parsed Resolution_Height
+ *   ger.exe+80A05  - 89 46 74          - mov [esi+74],eax   ; app context Height = eax
+ *
+ * esi holds the application-context object for the whole function (set once from ecx at function
+ * entry and never reassigned), so this is the single place in the whole boot sequence where the
+ * value read from config.ini becomes "real" as far as the rest of the engine (device creation,
+ * window sizing, everything downstream) is concerned. Hooking here edits the config.ini-derived
+ * value directly in the game's own memory, at the exact moment the game itself picks it up,
+ * entirely within the game's own process memory - no external file ever gets touched, and no
+ * dependency on any Windows API export existing under a particular name.
+ *
+ * A hook is placed on the first store (line 5 above, "mov [esi+70],eax"): eax is overwritten with
+ * our desired width right before that instruction executes, so the store faithfully writes our
+ * value. The stack slot backing the not-yet-executed height load two instructions later
+ * ([ebp-CC], read by line 6) is patched directly in the same callback, so by the time lines 6-7
+ * run natively they pick up our height too. One hook, both values.
+ *
+ * @return void
+ */
+void configResolutionFix() {
+    Utils::SignatureHook hook(
+        "8B 85 2C FF FF FF    B9 01 00 00 00    83 BD 30 FF FF FF 01    FF B5 28 FF FF FF    89 46 70",
+        24
+    );
+
+    bool enable = yml.masterEnable;
+    Utils::injectHook(enable, module, hook,
+        [](SafetyHookContext& ctx) {
+            ctx.eax = yml.resolution.width;
+            *reinterpret_cast<u32*>(ctx.ebp - 0xCC) = yml.resolution.height;
+        }
+    );
+}
+
+/**
  * @brief Fixes HUD elements by constraining them to 16:9.
  *
  * @details
@@ -448,6 +504,7 @@ DWORD WINAPI Main(void* lpParameter) {
     moviesFix();
     aspectRatioFix();
     resolutionFix();
+    configResolutionFix();
     hudElementsFix();
     return true;
 }
