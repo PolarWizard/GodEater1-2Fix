@@ -127,8 +127,8 @@ void readYml() {
         yml.resolution.height = dimensions.second;
     }
     yml.resolution.aspectRatio = static_cast<f32>(yml.resolution.width) / static_cast<f32>(yml.resolution.height);
-    nativeWidth = (16.0f / 9.0f) * static_cast<f32>(yml.resolution.height);
-    nativeOffset = static_cast<f32>(yml.resolution.width - nativeWidth) / 2.0f;
+    nativeWidth = static_cast<u32>((16.0f / 9.0f) * static_cast<f32>(yml.resolution.height));
+    nativeOffset = static_cast<u32>(static_cast<f32>(yml.resolution.width - nativeWidth) / 2.0f);
     widthScalingFactor = static_cast<f32>(yml.resolution.width) / static_cast<f32>(nativeWidth);
 
     // Get that info!
