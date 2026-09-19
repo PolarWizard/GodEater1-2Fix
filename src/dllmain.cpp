@@ -74,7 +74,6 @@ u32 nativeOffset = 0;
 f32 nativeAspectRatio = (16.0f / 9.0f);
 f32 widthScalingFactor = 0;
 
-SafetyHookInline readFileHook{};
 bool isMoviePlaying = false;
 
 YAML::Node config = YAML::LoadFile("GodEater1-2Fix.yml");
@@ -376,46 +375,6 @@ void hudElementsFix() {
 }
 
 /**
- * @brief Hook to intercept ReadFile calls.
- *
- * @details
- * The hook is placed on the ReadFile function of the kernel32.dll.
- * The hook intercepts the ReadFile call and checks the file path and if the file has a .wmv extension
- * then the isMoviePlaying variable is set to true.
- * None of the input parameters are dirtied, only hFile is read to determine the file extension.
- *
- * @param hFile A handle to the device.
- * @param lpBuffer A pointer to the buffer that receives the data read from a file or device.
- * @param nNumberOfBytesToRead The maximum number of bytes to be read.
- * @param lpNumberOfBytesRead A pointer to the variable that receives the number of bytes read when
- *  using a synchronous hFile parameter.
- * @param lpOverlapped A pointer to an OVERLAPPED structure is required if the hFile parameter was
- *  opened with FILE_FLAG_OVERLAPPED, otherwise it can be NULL.
- * @return BOOL If the function succeeds, the return value is nonzero (TRUE).
- *
- * @note https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
- */
-BOOL WINAPI kernelBaseDllReadFileHook(
-    HANDLE hFile,
-    LPVOID lpBuffer,
-    DWORD nNumberOfBytesToRead,
-    LPDWORD lpNumberOfBytesRead,
-    LPOVERLAPPED lpOverlapped
-) {
-    char fileName[MAX_PATH] = {0};
-    if (GetFinalPathNameByHandleA(hFile, fileName, MAX_PATH, FILE_NAME_NORMALIZED)) {
-        std::string pathStr(fileName);
-        if (pathStr.starts_with("\\\\?\\")) {
-            pathStr = pathStr.substr(4);
-        }
-        std::filesystem::path filePath(pathStr);
-        std::string extension = filePath.extension().string();
-        isMoviePlaying = extension == ".wmv" ? true : false;
-    }
-    return readFileHook.stdcall<BOOL>(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped);
-};
-
-/**
  * @brief Fixes movies by constraining them to 16:9.
  *
  * @details
@@ -425,68 +384,84 @@ BOOL WINAPI kernelBaseDllReadFileHook(
  * resolution fix when movies are being played.
  *
  * How was this found?
- * This is where things get a bit freaky. The game underhood seems to support a scripting engine and
- * most of the game is scripted through some properietary scripting language. Although with my research
- * there does not seem to be much work done reverse engineering it, but there is hints of it in those
- * .qpck files if you open them via a hex editor. Anyway, this makes it very hard to track down where
- * exactly movies begin to play and when they are considered to be finished.
+ * The engine has a dedicated `MovieWin32 : IMovie` class - DirectShow-backed
+ * (CoCreateInstance on the system FilterGraph, IGraphBuilder::RenderFile to build the playback
+ * graph, IMediaControl::Run/Pause/Stop to drive it) - found via its RTTI type descriptor string
+ * (".?AVMovieWin32@@"). Its vtable sits at ger.exe+22b0c; walking the surrounding function
+ * pointers and decompiling each (see docs/RE_LOG.md for the full dump and reasoning) gives a
+ * small, clean, self-consistent layout:
+ *   index 0 (+0x00) - scalar deleting destructor (confirms the vtable base - textbook MSVC
+ *                     pattern: resets the vtable ptr to the base class, frees if requested)
+ *   index 5 (+0x14) - Open(OpenParams*)   - builds the DirectShow graph, calls RenderFile
+ *   index 6 (+0x18) - Close()             - calls Stop() (index 8) first, then releases every
+ *                     COM interface the graph produced
+ *   index 8 (+0x20) - Stop()              - IMediaControl::Stop(), but only if a movie is
+ *                     actually loaded (see below - this matters a lot)
+ *   index 9 (+0x24) - SetPaused(bool)     - IMediaControl::Pause()/Run() depending on the bool
+ *   index 11 (+0x2c)- IsPaused()          - IMediaControl::GetState(), checks for State_Paused
+ *   index 12 (+0x30)- Update()            - per-frame tick; applies a pending pause/resume via
+ *                     index 9 and checks state via index 11
  *
- * In the game root folder you will see .qpck files, where the game stores practically everything:
- * event triggers, game logic, cutscene handling, AI behavior, sounds to play, etc.
- * If you navigate from the root folder to data/GameData you get a lot of folders, which host sound
- * files mainly, but we are interested only in the movie folder. All the movie files are .wmv.
+ * `Open()` is hooked at its entry for movie *start* - it's called exactly once per movie, before a
+ * single frame of it is ever decoded or rendered.
  *
- * Scanning for movie strings within the exe itself gets no hits, but the .qpck files do get hits,
- * another hint that the game does not have code which directly handles movies, but gets off loaded
- * to the suspected scripting language.
+ * `Close()` is not usable for movie *finished*, even though it looks like the obvious choice:
+ * `Open()`'s first real action (right after its SEH prologue) is `CALL dword ptr [EAX+0x18]` on
+ * its own vtable - it unconditionally calls `Close()` on itself first, as a defensive "tear down
+ * whatever was open before" reset. So `Close()` fires on every movie's *start* too, not just when
+ * one actually ends.
  *
- * Anyway, this is where things get hard how do we figure out where movies begin to play, well using
- * ProcMon we can see stack traces where the game reads files. With some filtering we can see that the
- * game makes repeatedly reads the movie file in chunks, meaning its streamed. The stack trace proves
- * this as the game exe eventually makes a call to quartz.dll, a Windows system library that's part
- * of DirectShow, a multimedia framework developed by Microsoft for video and audio playback, capture,
- * and streaming.
+ * `Stop()` is what signals "finished" - but only the part of it gated by a real `IMediaControl`
+ * being cached:
+ *   01821d57  PUSH ESI
+ *   01821d58  MOV ESI,ECX
+ *   01821d5a  CMP dword ptr [ESI+0x8],0x0      ; is an IMediaControl actually cached?
+ *   01821d5e  JZ 0x01821d78                    ; if not, skip straight to a self+0x40 no-op
+ *   ...
+ *   01821d6f  MOV EAX,dword ptr [ESI+0x8]      ; <- hooked here
+ *   01821d72  PUSH EAX
+ *   01821d73  MOV ECX,dword ptr [EAX]
+ *   01821d75  CALL dword ptr [ECX+0x24]        ; the real IMediaControl::Stop() call
+ *   01821d78  ...
+ * `Stop()` only calls the real `IMediaControl::Stop()` when `[this+0x8]` (the cached
+ * `IMediaControl` pointer) is non-null - i.e. only when a movie was genuinely open and playing. On
+ * the defensive `Open()`-triggered `Close()`-triggered `Stop()` that happens before any movie has
+ * ever opened, that pointer is still null, so this call is skipped entirely. Reaching `01821d6f`
+ * at all already proves a real movie was open, so hooking there catches every genuine "movie has
+ * finished", whether reached via an explicit stop/close elsewhere or via the next movie's `Open()`
+ * defensively closing this one.
  *
- * Under the hood quartz.dll eventually calls ReadFile function from KernelBase.dll, so the game itself
- * does not even touch the movie file itself, it only provides the path which makes sense since those
- * .qpck files are littered with paths to the movie and sound files.
+ * Neither hook alters anything either function actually does; both just read/write our own
+ * `isMoviePlaying` global. No Windows API is involved anywhere in this fix.
  *
- * As I said in the beginning this is where it gets freaky, we cannot rely on hooking based on calls
- * to quartz.dll functions, we need to go even deeper and hook the ReadFile function from KernelBase.dll,
- * because the first param to ReadFile is the file handle, which can be easily used to figure out what
- * file is being read. And that is exactly what is being done in the fix, we figure out from the file
- * handle if it is a file ending with .wmv and if it is a movie is currently playing, if its anything
- * else a movie is not playing. This works because the movie itself is read in chunks and the game
- * is basically IO blocked until the movie is fully played or the user skips it, where it goes back
- * to reading the .qpck files either to get the next script to execute or get some asset or do something
- * else.
- *
- * But this is the most reliable way to detect if and when a movie is playing. No fancy tricks in the
- * game code, just abusing Windows APIs to our benefit.
+ * Known limitation: back-to-back movies with no gameplay in between would see the *next* movie's
+ * `Open()` (sets isMoviePlaying=true) immediately followed by its own defensive Close()->Stop()
+ * chain correctly stopping the *previous* movie (sets isMoviePlaying=false) - momentarily leaving
+ * isMoviePlaying=false while the next movie is in fact already playing, until something else
+ * flips it back. Not observed in practice and cosmetic at worst (HUD briefly not constrained).
  *
  * @return void
  */
-void moviesFix()
-{
+void moviesFix() {
+    Utils::SignatureHook openHook(
+        "55 89 E5 6A FF 68 EF 35 38 02 64 A1 00 00 00 00 50 81 EC 3C 01 00 00"
+    );
+    Utils::SignatureHook realStopHook(
+        "56 89 CE 83 7E 08 00 74 18 8B 4E 1C 85 C9 74 08 8B 01 FF 90 80 00 00 00 8B 46 08 50 8B 08 FF 51 24",
+        24
+    );
+
     bool enable = yml.masterEnable;
-    if (enable == true) {
-        std::string targetDll = "KernelBase.dll";
-        HMODULE kernelBaseAddr = GetModuleHandleA(targetDll.c_str());
-        if (!kernelBaseAddr) {
-            LOG("Failed to get handle to {:s}", targetDll.c_str());
-            return;
+    Utils::injectHook(enable, module, openHook,
+        [](SafetyHookContext& ctx) {
+            isMoviePlaying = true;
         }
-
-        std::string dllFunction = "ReadFile";
-        void* readFileAddr = GetProcAddress(kernelBaseAddr, dllFunction.c_str());
-        if (!readFileAddr) {
-            LOG("Failed to get address of {:s}", dllFunction.c_str());
-            return;
+    );
+    Utils::injectHook(enable, module, realStopHook,
+        [](SafetyHookContext& ctx) {
+            isMoviePlaying = false;
         }
-
-        readFileHook = safetyhook::create_inline(reinterpret_cast<void*>(readFileAddr), reinterpret_cast<void*>(&kernelBaseDllReadFileHook));
-        LOG("Hooked {:s} @ {:s}+{:x}", dllFunction.c_str(), targetDll.c_str(), reinterpret_cast<u64>(readFileAddr) - reinterpret_cast<u64>(kernelBaseAddr));
-    }
+    );
 }
 
 /**
